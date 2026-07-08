@@ -1,0 +1,22 @@
+# MindCare Psychology Chatbot Requirements
+# This chatbot runs on Python 3.6+ with no external dependencies
+# All functionality is built using Python's standard library
+
+# For development and testing
+pytest>=6.0.0
+coverage>=5.0.0
+flake8>=3.0.0
+black>=21.0.0
+mypy>=0.900
+
+# For running the chatbot (no additional packages needed)
+# The chatbot uses only Python's standard library:
+# - datetime
+# - json
+# - re (regular expressions)
+# - random
+# - typing
+# - enum
+# - unittest (for testing)
+# - tempfile (for testing)
+# - os (for file operations)
