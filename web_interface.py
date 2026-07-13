@@ -4,18 +4,94 @@ MindCare Web Interface
 A simple web interface for the psychology chatbot using Flask
 """
 
-from flask import Flask, request, jsonify, render_template_string
-from main import PsychologyChatbot
 import datetime
 import os
+import secrets
+import threading
+import uuid
+
+from flask import Flask, request, jsonify, render_template_string, session
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+from main import PsychologyChatbot
 
 app = Flask(__name__)
 
-# Create a global chatbot instance
-chatbot = PsychologyChatbot("MindCare")
+# A secret key is required to sign the session cookie that identifies each
+# visitor. Set SECRET_KEY in the environment for any real deployment - if
+# it's not set we fall back to a random key generated at startup, which
+# means every restart invalidates existing sessions. That's an acceptable
+# default for local/dev use but should not be relied on in production.
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+if not os.environ.get("SECRET_KEY"):
+    print(
+        "WARNING: SECRET_KEY not set in the environment - using a randomly "
+        "generated key for this process. Sessions will not survive a "
+        "restart. Set SECRET_KEY for production deployments."
+    )
+
+# Cap request body size to prevent trivially large payloads.
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024  # 16 KB
+
+MAX_MESSAGE_LENGTH = 2000
+SESSION_TIMEOUT = datetime.timedelta(hours=2)
+app.permanent_session_lifetime = SESSION_TIMEOUT
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["60 per minute"],
+    storage_uri="memory://",
+)
+
+
+class _SessionEntry:
+    """One chatbot + lock per browser session."""
+
+    def __init__(self):
+        self.chatbot = PsychologyChatbot("MindCare")
+        self.lock = threading.Lock()
+        self.last_active = datetime.datetime.now()
+
+
+# In-process, per-session chatbot store. This replaces the old module-level
+# singleton `chatbot` instance that every visitor shared (which leaked
+# conversation history, names, and crisis state across unrelated users).
+#
+# Note: this dict lives in one process's memory. It resets on restart and
+# is NOT shared across multiple worker processes - if this is ever run
+# behind gunicorn/uwsgi with more than one worker, move this to a shared
+# store (e.g. Redis) instead, or pin to a single worker.
+_sessions: dict = {}
+_sessions_lock = threading.Lock()
+
+
+def _prune_stale_sessions():
+    """Drop sessions that have been idle past SESSION_TIMEOUT."""
+    cutoff = datetime.datetime.now() - SESSION_TIMEOUT
+    stale = [sid for sid, entry in _sessions.items() if entry.last_active < cutoff]
+    for sid in stale:
+        _sessions.pop(sid, None)
+
+
+def _get_session_entry() -> _SessionEntry:
+    """Get (creating if needed) the chatbot session tied to this browser."""
+    sid = session.get("session_id")
+    with _sessions_lock:
+        if not sid or sid not in _sessions:
+            sid = uuid.uuid4().hex
+            session["session_id"] = sid
+            session.permanent = True
+            _sessions[sid] = _SessionEntry()
+            _prune_stale_sessions()
+        entry = _sessions[sid]
+        entry.last_active = datetime.datetime.now()
+        return entry
+
 
 # HTML template for the web interface
-HTML_TEMPLATE = """
+HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -311,9 +387,10 @@ HTML_TEMPLATE = """
         // Send message on button click
         sendButton.addEventListener('click', sendMessage);
         
-        // Send message on Enter key
-        messageInput.addEventListener('keypress', function(e) {
+        // Send message on Enter key - use keydown instead of keypress for better compatibility
+        messageInput.addEventListener('keydown', function(e) {
             if (e.key === 'Enter') {
+                e.preventDefault(); // Prevent form submission if any
                 sendMessage();
             }
         });
@@ -389,13 +466,25 @@ HTML_TEMPLATE = """
             scrollToBottom();
         }
         
+        // Escape HTML special characters so any text we later inject via
+        // innerHTML can't be interpreted as markup/scripts. All bot replies
+        // currently come from a fixed knowledge base, but escaping here
+        // means this stays safe even if a future response ever reflects
+        // user-provided text back into the chat.
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
         // Add bot message to chat
         function addBotMessage(message) {
             const messageDiv = document.createElement('div');
             messageDiv.className = 'message bot-message';
             
-            // Convert newlines to <br> and format lists
-            let formattedMessage = message
+            // Escape first, then apply our own lightweight markdown-ish
+            // formatting (bold, bullets, newlines) on top of the escaped text.
+            let formattedMessage = escapeHtml(message)
                 .replace(/\n\n/g, '<p></p>')
                 .replace(/\n/g, '<br>')
                 .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
@@ -459,36 +548,49 @@ def index():
 
 
 @app.route('/chat', methods=['POST'])
+@limiter.limit("20 per minute")
 def chat():
     """Handle chat messages"""
-    data = request.get_json()
+    # get_json(silent=True) returns None instead of raising on a missing or
+    # malformed body, so a bad request can't crash the process anymore.
+    data = request.get_json(silent=True) or {}
     user_message = data.get('message', '')
-    
-    # Process the message
-    response = chatbot.process_input(user_message)
-    
-    # Get crisis level
-    crisis_level = chatbot.crisis_level.value
-    
+
+    if not isinstance(user_message, str) or not user_message.strip():
+        return jsonify({'error': 'message must be a non-empty string'}), 400
+
+    if len(user_message) > MAX_MESSAGE_LENGTH:
+        return jsonify({
+            'error': f'message must be under {MAX_MESSAGE_LENGTH} characters'
+        }), 400
+
+    entry = _get_session_entry()
+    with entry.lock:
+        response = entry.chatbot.process_input(user_message)
+        crisis_level = entry.chatbot.crisis_level.value
+
     return jsonify({
         'response': response,
         'crisis_level': crisis_level
     })
 
 
-@app.route('/reset')
+@app.route('/reset', methods=['POST'])
 def reset():
-    """Reset the chatbot"""
-    global chatbot
-    chatbot = PsychologyChatbot("MindCare")
+    """Reset the current user's chatbot session (does not affect other users)"""
+    entry = _get_session_entry()
+    with entry.lock:
+        entry.chatbot = PsychologyChatbot("MindCare")
     return jsonify({'status': 'reset'})
 
 
 @app.route('/summary')
 def summary():
-    """Get conversation summary"""
-    summary = chatbot.get_conversation_summary()
-    return jsonify({'summary': summary})
+    """Get conversation summary for the current user's session"""
+    entry = _get_session_entry()
+    with entry.lock:
+        summary_text = entry.chatbot.get_conversation_summary()
+    return jsonify({'summary': summary_text})
 
 
 @app.route('/health')
@@ -499,6 +601,20 @@ def health():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    # Debug mode is OFF by default. It enables the interactive Werkzeug
+    # debugger, which allows arbitrary code execution from the browser on
+    # any unhandled exception - never turn this on outside local development.
+    debug_mode = os.environ.get('FLASK_DEBUG', 'false').lower() in ('1', 'true', 'yes')
+    # Default to loopback-only; set HOST=0.0.0.0 explicitly (behind a real
+    # WSGI server/reverse proxy) for anything beyond local development.
+    host = os.environ.get('HOST', '127.0.0.1')
+
     print(f"Starting MindCare Web Interface on port {port}")
-    print("Open your browser and navigate to: http://localhost:{}".format(port))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    print(f"Open your browser and navigate to: http://localhost:{port}")
+    if debug_mode:
+        print(
+            "WARNING: FLASK_DEBUG is enabled. Do not use this in production - "
+            "the interactive debugger allows remote code execution."
+        )
+
+    app.run(host=host, port=port, debug=debug_mode)

@@ -1,0 +1,28 @@
+{
+  "user_name": null,
+  "start_time": "2026-07-08T20:05:50.179376",
+  "end_time": "2026-07-08T20:06:36.971748",
+  "conversation_history": [
+    {
+      "user": "hi",
+      "timestamp": "2026-07-08T20:06:05.474632",
+      "emotion": "neutral"
+    },
+    {
+      "user": "who r u",
+      "timestamp": "2026-07-08T20:06:13.047788",
+      "emotion": "neutral"
+    },
+    {
+      "user": "what is your name",
+      "timestamp": "2026-07-08T20:06:22.656510",
+      "emotion": "neutral"
+    }
+  ],
+  "emotion_history": [
+    "neutral",
+    "neutral",
+    "neutral"
+  ],
+  "crisis_level": 0
+}
