@@ -1,0 +1,25 @@
+# MindCare Psychology Chatbot Requirements
+# The core chatbot engine (main.py) uses only Python's standard library.
+# The web interface (web_interface.py) requires Flask and Flask-Limiter.
+
+# For development and testing
+pytest>=6.0.0
+coverage>=5.0.0
+flake8>=3.0.0
+black>=21.0.0
+mypy>=0.900
+
+# For the web interface
+flask==3.1.3
+flask-limiter>=3.5.0
+
+# The core chatbot engine (main.py) uses only Python's standard library:
+# - datetime
+# - json
+# - re (regular expressions)
+# - random
+# - typing
+# - enum
+# - unittest (for testing)
+# - tempfile (for testing)
+# - os (for file operations)
